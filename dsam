@@ -1,15 +1,26 @@
 #!/bin/sh
-# usage: dsam <install|config|diff|info|track|ignore> [args]
+# usage: dsam <install|update|config|diff|info|track|ignore> [args]
+#   install <pkg>...   install or sync packages, record them in the profile's packages.txt;
+#                      a packages/<pkg> already installed is rebuilt when its PKGBUILD
+#                      version differs (up or down) and its .dotfiles are re-linked
+#   update [-i a,b]    paru -Syu (fails if it does not finish), then sync packages/ ones;
+#                      held packages: -i flag and profiles/<profile>/ignore-packages.txt
+#   config             deploy tracked files, then run configure.sh
+#   diff [-d] [-u]     drift report; -d dependencies, -u unowned files
+#   info <pkg|path>    class of a package, or type and owner of a file
+#   track <file>       copy an unowned system file into the profile and deploy it from there
+#   ignore <glob>...   accept unowned paths
 set -eu
 export LC_ALL=C
 
 here=$(dirname "$(readlink -f "$0")")
+# shellcheck disable=SC1091
+. "$here/lib.sh"
+refuse_root
 
-die() { printf 'dsam: %s\n' "$*" >&2; exit 1; }
-as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else doas "$@"; fi; }
+tab=$(printf '\t')
 kv() { printf '%-12s %s\n' "$1" "$2"; }
 has() { grep -qxF -- "$1" "$2"; }
-clean() { sed 's/#.*//; s/[[:space:]]*$//; /^[[:space:]]*$/d' "$@" 2>/dev/null | sort -u; }
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -27,6 +38,7 @@ manifest=$pdir/files.manifest
 base_list() {
 	{
 		clean "$here/base-packages.txt"
+		echo paru
 		case $(awk -F': ' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo) in
 			GenuineIntel) echo intel-ucode ;;
 			AuthenticAMD) echo amd-ucode ;;
@@ -43,6 +55,19 @@ load_pkgs() {
 	pacman -Qqe | sort -u > "$tmp/explicit"
 	pacman -Qqd | sort -u > "$tmp/deps"
 	pacman -Qqdt | sort -u > "$tmp/orphans"
+}
+
+# expected symlinks from the .dotfiles of every declared package
+load_links() {
+	: > "$tmp/links"
+	while IFS= read -r p; do
+		src=$here/packages/$p/.dotfiles
+		[ -d "$src" ] || continue
+		(cd "$src" && find . \( -type f -o -type l \) | sed 's|^\./||') | while IFS= read -r f; do
+			printf '%s\t%s\n' "$HOME/$f" "$src/$f"
+		done >> "$tmp/links"
+	done < "$tmp/declared"
+	cut -f1 "$tmp/links" | sort -u > "$tmp/linkpaths"
 }
 
 load_ignore() {
@@ -75,11 +100,6 @@ is_user_data() {
 	return 1
 }
 
-is_managed() {
-	command -v chezmoi >/dev/null 2>&1 || return 1
-	chezmoi managed --path-style absolute 2>/dev/null | grep -qxF -- "$1"
-}
-
 pkg_class() {
 	if has "$1" "$tmp/base"; then echo base
 	elif has "$1" "$tmp/first"; then echo first
@@ -89,37 +109,65 @@ pkg_class() {
 	fi
 }
 
-# ---------- install ----------
+# paths such as /boot are root-only, so fall back to doas when needed
+exists() { [ -e "$1" ] || as_root test -e "$1" < /dev/null; }
+meta() { stat -c '%a %U:%G' -- "$1" 2>/dev/null || as_root stat -c '%a %U:%G' -- "$1" < /dev/null; }
+same() {
+	if [ -r "$2" ]; then cmp -s "$1" "$2"; else as_root cmp -s "$1" "$2" < /dev/null; fi
+}
+
+# ---------- install / update ----------
 
 cmd_install() {
 	[ $# -ge 1 ] || die "usage: dsam install <package>..."
-	[ "$(id -u)" -ne 0 ] || die "run as a regular user"
 	load_pkgs
+	pkg_install "$@"
 	for p; do
-		case $p in
-			dsam-*) name=$p ;;
-			*) name=dsam-$p ;;
-		esac
-		custom=$here/pkgbuilds/$name
-		if [ -f "$custom/PKGBUILD" ]; then
-			(cd "$custom" && paru -Bi)
-			if [ -x "$custom/setup.sh" ]; then "$custom/setup.sh"; fi
-		else
-			name=$p
-			paru -S --needed -- "$p"
+		if has "$p" "$tmp/base" || clean "$pdir/packages.txt" | grep -qxF -- "$p"; then
+			continue
 		fi
-		if ! has "$name" "$tmp/declared"; then
-			touch "$pdir/packages.txt"
-			printf '%s\n' "$name" >> "$pdir/packages.txt"
-		fi
+		touch "$pdir/packages.txt"
+		printf '%s\n' "$p" >> "$pdir/packages.txt"
 	done
+}
+
+cmd_update() {
+	: > "$tmp/hold"
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-i|--ignore)
+				[ $# -ge 2 ] || die "update: $1 needs a package list"
+				printf '%s\n' "$2" | tr ',' '\n' | sed '/^$/d' >> "$tmp/hold"
+				shift ;;
+			*) die "update: unknown option: $1" ;;
+		esac
+		shift
+	done
+	clean "$pdir/ignore-packages.txt" >> "$tmp/hold"
+	sort -u "$tmp/hold" -o "$tmp/hold"
+	hold=$(paste -sd, "$tmp/hold")
+
+	load_pkgs
+	sync_srcinfo
+	say "system update"
+	set -- -Syu
+	if [ -n "$hold" ]; then set -- "$@" --ignore "$hold"; fi
+	aur "$@" || die "paru -Syu did not finish, nothing else was updated; re-run once the network is fixed"
+
+		say "package overlays and custom builds"
+	while IFS= read -r p; do
+		has_dir "$p" || continue
+		if has "$p" "$tmp/hold"; then say "held: $p"; continue; fi
+		sync_package "$p"
+	done < "$tmp/declared"
 }
 
 # ---------- config ----------
 
-cmd_config() {
-	if [ -f "$manifest" ]; then
-		grep -Ev '^[[:space:]]*(#|$)' "$manifest" | while read -r mode own path; do
+cmdconfig()	if is_custom "$1"; then kv source: "packages/$1 (built)"
+	elif has_dir "$1"; then kv source: "packages/$1 (dotfiles overlay)"
+	fi:]]*(#|$)'
+	 "$manifest" | while read -r mode own path; do
 			as_root install -D -m "$mode" -o "${own%%:*}" -g "${own#*:}" \
 				-- "$pdir/files$path" "$path" < /dev/null
 		done
@@ -143,30 +191,31 @@ diff_files() {
 	printf '== tracked files ==\n'
 	[ -f "$manifest" ] || return 0
 	grep -Ev '^[[:space:]]*(#|$)' "$manifest" | while read -r mode own path; do
-		if [ ! -e "$path" ]; then
+		if ! exists "$path"; then
 			printf 'missing     %s\n' "$path"
-		elif [ ! -r "$path" ]; then
-			printf 'unreadable  %s\n' "$path"
-		elif ! cmp -s "$pdir/files$path" "$path"; then
+		elif ! same "$pdir/files$path" "$path"; then
 			printf 'modified    %s\n' "$path"
-		elif [ "$(stat -c '%a %U:%G' -- "$path")" != "${mode#0} $own" ]; then
+		elif [ "$(meta "$path")" != "${mode#0} $own" ]; then
 			printf 'metadata    %s\n' "$path"
 		fi
 	done
 }
 
 diff_home() {
-	printf '== home (chezmoi) ==\n'
-	if command -v chezmoi >/dev/null 2>&1; then
-		chezmoi status
-	else
-		printf 'chezmoi not installed\n'
-	fi
+	printf '== home (.dotfiles links) ==\n'
+	while IFS=$tab read -r link target; do
+		if [ -L "$link" ] && [ "$(readlink -- "$link")" = "$target" ]; then continue; fi
+		if [ -L "$link" ] || [ -e "$link" ]; then
+			printf 'conflict    %s\n' "$link"
+		else
+			printf 'unlinked    %s\n' "$link"
+		fi
+	done < "$tmp/links"
 }
 
 diff_unowned() {
 	printf '== unowned files ==\n'
-	{ find / -xdev; find /boot -xdev; } 2>/dev/null | sort -u > "$tmp/all"
+	{ find / -xdev; as_root find /boot -xdev < /dev/null; } 2>/dev/null | sort -u > "$tmp/all"
 	pacman -Qlq | sed 's:/$::' | sort -u > "$tmp/owned"
 	comm -23 "$tmp/all" "$tmp/owned" | while IFS= read -r f; do
 		[ "$f" != / ] || continue
@@ -174,13 +223,21 @@ diff_unowned() {
 		has "$f" "$tmp/tracked" && continue
 		printf 'unknown     %s\n' "$f"
 	done
-	if command -v chezmoi >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
-		chezmoi unmanaged --path-style absolute 2>/dev/null | while IFS= read -r f; do
-			is_user_data "$f" && continue
-			is_ignored "$f" && continue
-			printf 'unknown     %s\n' "$f"
-		done
-	fi
+
+	printf '== unowned files (home) ==\n'
+	for e in "$HOME"/.[!.]*; do
+		if [ -e "$e" ] || [ -L "$e" ]; then find "$e" \( -type f -o -type l \) 2>/dev/null; fi
+	done | sort -u > "$tmp/home_all"
+	while IFS= read -r f; do
+		is_ignored "$f" && continue
+		has "$f" "$tmp/linkpaths" && continue
+		if [ -L "$f" ]; then
+			case $(readlink -- "$f") in
+				"$here"/packages/*) printf 'stale       %s\n' "$f"; continue ;;
+			esac
+		fi
+		printf 'unknown     %s\n' "$f"
+	done < "$tmp/home_all"
 }
 
 cmd_diff() {
@@ -194,6 +251,7 @@ cmd_diff() {
 		esac
 	done
 	load_pkgs
+	load_links
 	load_ignore
 	load_tracked
 	diff_packages
@@ -206,9 +264,12 @@ cmd_diff() {
 
 info_pkg() {
 	load_pkgs
-	if pacman -Qq -- "$1" >/dev/null 2>&1; then inst=yes; else inst=no; fi
+	if pacman -Qq -- "$1" > /dev/null 2>&1; then inst=yes; else inst=no; fi
 	kv package: "$1"
 	kv installed: "$inst"
+	if is_custom "$1"; then kv source: "packages/$1 (built)"
+	elif has_dir "$1"; then kv source: "packages/$1 (dotfiles overlay)"
+	fi
 	case $(pkg_class "$1") in
 		base) kv class: base ;;
 		first) kv class: "first (packages.txt)" ;;
@@ -223,12 +284,14 @@ info_pkg() {
 }
 
 info_file() {
-	path=$(readlink -m -- "$1")
+	path=$(realpath -sm -- "$1")
+	load_pkgs
+	load_links
 	load_ignore
 	load_tracked
 	owner=$(pacman -Qoq -- "$path" 2>/dev/null || true)
 	if has "$path" "$tmp/tracked"; then type=config
-	elif is_managed "$path"; then type=config
+	elif has "$path" "$tmp/linkpaths"; then type=config
 	elif is_ignored "$path"; then type=ignored
 	elif is_user_data "$path"; then type=user_data
 	elif [ -n "$owner" ]; then type=owned
@@ -254,7 +317,7 @@ cmd_track() {
 	path=$(readlink -f -- "$1")
 	[ -f "$path" ] || die "not a regular file: $path"
 	case $path in
-		"$HOME"/*) die "home files belong to chezmoi: $path" ;;
+		"$HOME"/*) die "home files belong in a package's .dotfiles: $path" ;;
 		/etc/shadow*|/etc/gshadow*|/etc/ssh/ssh_host_*|/etc/NetworkManager/system-connections/*)
 			die "refusing to track secrets: $path" ;;
 	esac
@@ -283,10 +346,12 @@ cmd=${1:-}
 if [ $# -gt 0 ]; then shift; fi
 case $cmd in
 	install) cmd_install "$@" ;;
+	update) cmd_update "$@" ;;
 	config) cmd_config "$@" ;;
 	diff) cmd_diff "$@" ;;
 	info) cmd_info "$@" ;;
 	track) cmd_track "$@" ;;
 	ignore) cmd_ignore "$@" ;;
-	*) die "usage: dsam <install|config|diff|info|track|ignore> [args]" ;;
+	*) die "usage: dsam <install|update|config|diff|info|track|ignore> [args]" ;;
 esac
+exit "$DSAM_RC"

@@ -9,11 +9,13 @@
 /etc/machine-id
 /etc/adjtime
 /etc/*-
+/etc/dsam/*
 /etc/ssh/ssh_host_*
 /etc/ld.so.cache
 /etc/pacman.d/gnupg/*
 /etc/ca-certificates/extracted/*
 /etc/ssl/certs/*
+/usr/local/bin/dsam
 /usr/lib/locale/locale-archive
 /usr/share/mime/*
 /usr/share/icons/*/icon-theme.cache
@@ -21,3 +23,7 @@
 /boot/initramfs-*
 /boot/EFI/*
 /boot/loader/random-seed
+*/.cache/*
+*/.local/state/*
+*/.local/share/Trash/*
+*/.local/share/bubblejail/*
