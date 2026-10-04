@@ -1,0 +1,292 @@
+#!/bin/sh
+# usage: dsam <install|config|diff|info|track|ignore> [args]
+set -eu
+export LC_ALL=C
+
+here=$(dirname "$(readlink -f "$0")")
+
+die() { printf 'dsam: %s\n' "$*" >&2; exit 1; }
+as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else doas "$@"; fi; }
+kv() { printf '%-12s %s\n' "$1" "$2"; }
+has() { grep -qxF -- "$1" "$2"; }
+clean() { sed 's/#.*//; s/[[:space:]]*$//; /^[[:space:]]*$/d' "$@" 2>/dev/null | sort -u; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+profile=${DSAM_PROFILE:-$(cat /etc/dsam/profile 2>/dev/null || true)}
+[ -n "$profile" ] || die "no active profile (/etc/dsam/profile)"
+pdir=$here/profiles/$profile
+[ -f "$pdir/profile.conf" ] || die "unknown profile: $profile"
+# shellcheck disable=SC1091
+. "$pdir/profile.conf"
+manifest=$pdir/files.manifest
+
+# ---------- shared state ----------
+
+base_list() {
+	{
+		clean "$here/base-packages.txt"
+		case $(awk -F': ' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo) in
+			GenuineIntel) echo intel-ucode ;;
+			AuthenticAMD) echo amd-ucode ;;
+		esac
+		if [ "$SWAP" = zram ]; then echo zram-generator; fi
+	} | sort -u
+}
+
+load_pkgs() {
+	base_list > "$tmp/base"
+	clean "$pdir/packages.txt" > "$tmp/first"
+	sort -u "$tmp/base" "$tmp/first" > "$tmp/declared"
+	pacman -Qq | sort -u > "$tmp/installed"
+	pacman -Qqe | sort -u > "$tmp/explicit"
+	pacman -Qqd | sort -u > "$tmp/deps"
+	pacman -Qqdt | sort -u > "$tmp/orphans"
+}
+
+load_ignore() {
+	{ cat "$here/ignore.list" "$pdir/ignore.list" 2>/dev/null || true; } \
+		| sed '/^[[:space:]]*\(#\|$\)/d' > "$tmp/ignore"
+}
+
+load_tracked() {
+	if [ -f "$manifest" ]; then
+		awk '/^[[:space:]]*(#|$)/ { next } { sub(/^[^ ]+ +[^ ]+ +/, ""); print }' "$manifest" \
+			| sort -u > "$tmp/tracked"
+	else
+		: > "$tmp/tracked"
+	fi
+}
+
+is_ignored() {
+	while IFS= read -r pat; do
+		# shellcheck disable=SC2254
+		case $1 in $pat) return 0 ;; esac
+	done < "$tmp/ignore"
+	return 1
+}
+
+is_user_data() {
+	case $1 in
+		"$HOME"/.*) return 1 ;;
+		"$HOME"/*) return 0 ;;
+	esac
+	return 1
+}
+
+is_managed() {
+	command -v chezmoi >/dev/null 2>&1 || return 1
+	chezmoi managed --path-style absolute 2>/dev/null | grep -qxF -- "$1"
+}
+
+pkg_class() {
+	if has "$1" "$tmp/base"; then echo base
+	elif has "$1" "$tmp/first"; then echo first
+	elif has "$1" "$tmp/deps"; then echo second
+	elif has "$1" "$tmp/explicit"; then echo untracked
+	else echo none
+	fi
+}
+
+# ---------- install ----------
+
+cmd_install() {
+	[ $# -ge 1 ] || die "usage: dsam install <package>..."
+	[ "$(id -u)" -ne 0 ] || die "run as a regular user"
+	load_pkgs
+	for p; do
+		case $p in
+			dsam-*) name=$p ;;
+			*) name=dsam-$p ;;
+		esac
+		custom=$here/pkgbuilds/$name
+		if [ -f "$custom/PKGBUILD" ]; then
+			(cd "$custom" && paru -Bi)
+			if [ -x "$custom/setup.sh" ]; then "$custom/setup.sh"; fi
+		else
+			name=$p
+			paru -S --needed -- "$p"
+		fi
+		if ! has "$name" "$tmp/declared"; then
+			touch "$pdir/packages.txt"
+			printf '%s\n' "$name" >> "$pdir/packages.txt"
+		fi
+	done
+}
+
+# ---------- config ----------
+
+cmd_config() {
+	if [ -f "$manifest" ]; then
+		grep -Ev '^[[:space:]]*(#|$)' "$manifest" | while read -r mode own path; do
+			as_root install -D -m "$mode" -o "${own%%:*}" -g "${own#*:}" \
+				-- "$pdir/files$path" "$path" < /dev/null
+		done
+	fi
+	if [ -x "$here/configure.sh" ]; then exec "$here/configure.sh" "$@"; fi
+}
+
+# ---------- diff ----------
+
+diff_packages() {
+	printf '== packages ==\n'
+	comm -23 "$tmp/declared" "$tmp/installed" | sed 's/^/missing     /'
+	comm -13 "$tmp/declared" "$tmp/explicit" | sed 's/^/untracked   /'
+	if [ "$deps" -eq 1 ]; then
+		comm -23 "$tmp/deps" "$tmp/orphans" | sed 's/^/dependency  /'
+		sed 's/^/orphan      /' "$tmp/orphans"
+	fi
+}
+
+diff_files() {
+	printf '== tracked files ==\n'
+	[ -f "$manifest" ] || return 0
+	grep -Ev '^[[:space:]]*(#|$)' "$manifest" | while read -r mode own path; do
+		if [ ! -e "$path" ]; then
+			printf 'missing     %s\n' "$path"
+		elif [ ! -r "$path" ]; then
+			printf 'unreadable  %s\n' "$path"
+		elif ! cmp -s "$pdir/files$path" "$path"; then
+			printf 'modified    %s\n' "$path"
+		elif [ "$(stat -c '%a %U:%G' -- "$path")" != "${mode#0} $own" ]; then
+			printf 'metadata    %s\n' "$path"
+		fi
+	done
+}
+
+diff_home() {
+	printf '== home (chezmoi) ==\n'
+	if command -v chezmoi >/dev/null 2>&1; then
+		chezmoi status
+	else
+		printf 'chezmoi not installed\n'
+	fi
+}
+
+diff_unowned() {
+	printf '== unowned files ==\n'
+	{ find / -xdev; find /boot -xdev; } 2>/dev/null | sort -u > "$tmp/all"
+	pacman -Qlq | sed 's:/$::' | sort -u > "$tmp/owned"
+	comm -23 "$tmp/all" "$tmp/owned" | while IFS= read -r f; do
+		[ "$f" != / ] || continue
+		is_ignored "$f" && continue
+		has "$f" "$tmp/tracked" && continue
+		printf 'unknown     %s\n' "$f"
+	done
+	if command -v chezmoi >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
+		chezmoi unmanaged --path-style absolute 2>/dev/null | while IFS= read -r f; do
+			is_user_data "$f" && continue
+			is_ignored "$f" && continue
+			printf 'unknown     %s\n' "$f"
+		done
+	fi
+}
+
+cmd_diff() {
+	deps=0
+	unowned=0
+	for a; do
+		case $a in
+			-d|--deps) deps=1 ;;
+			-u|--unowned) unowned=1 ;;
+			*) die "diff: unknown option: $a" ;;
+		esac
+	done
+	load_pkgs
+	load_ignore
+	load_tracked
+	diff_packages
+	diff_files
+	diff_home
+	if [ "$unowned" -eq 1 ]; then diff_unowned; fi
+}
+
+# ---------- info ----------
+
+info_pkg() {
+	load_pkgs
+	if pacman -Qq -- "$1" >/dev/null 2>&1; then inst=yes; else inst=no; fi
+	kv package: "$1"
+	kv installed: "$inst"
+	case $(pkg_class "$1") in
+		base) kv class: base ;;
+		first) kv class: "first (packages.txt)" ;;
+		second)
+			kv class: "second (dependency)"
+			kv required-by: "$(pacman -Qi -- "$1" | sed -n 's/^Required By *: *//p')"
+			if has "$1" "$tmp/orphans"; then kv note: "orphan, nothing requires it"; fi
+			;;
+		untracked) kv class: "untracked (explicitly installed, not declared)" ;;
+		none) kv class: "none (not installed, not declared)" ;;
+	esac
+}
+
+info_file() {
+	path=$(readlink -m -- "$1")
+	load_ignore
+	load_tracked
+	owner=$(pacman -Qoq -- "$path" 2>/dev/null || true)
+	if has "$path" "$tmp/tracked"; then type=config
+	elif is_managed "$path"; then type=config
+	elif is_ignored "$path"; then type=ignored
+	elif is_user_data "$path"; then type=user_data
+	elif [ -n "$owner" ]; then type=owned
+	else type=untracked
+	fi
+	kv path: "$path"
+	kv type: "$type"
+	kv owner: "${owner:-none}"
+}
+
+cmd_info() {
+	[ $# -eq 1 ] || die "usage: dsam info <package|path>"
+	case $1 in
+		*/*|.*) info_file "$1" ;;
+		*) info_pkg "$1" ;;
+	esac
+}
+
+# ---------- track / ignore ----------
+
+cmd_track() {
+	[ $# -eq 1 ] || die "usage: dsam track <file>"
+	path=$(readlink -f -- "$1")
+	[ -f "$path" ] || die "not a regular file: $path"
+	case $path in
+		"$HOME"/*) die "home files belong to chezmoi: $path" ;;
+		/etc/shadow*|/etc/gshadow*|/etc/ssh/ssh_host_*|/etc/NetworkManager/system-connections/*)
+			die "refusing to track secrets: $path" ;;
+	esac
+	dest=$pdir/files$path
+	mkdir -p "$(dirname "$dest")"
+	as_root cat -- "$path" > "$dest"
+	mode=$(stat -c '%a' -- "$path")
+	own=$(stat -c '%U:%G' -- "$path")
+	touch "$manifest"
+	awk -v p="$path" '{ q = $0; sub(/^[^ ]+ +[^ ]+ +/, "", q); if (q != p) print }' "$manifest" > "$tmp/manifest"
+	printf '%04d %s %s\n' "$mode" "$own" "$path" >> "$tmp/manifest"
+	sort -k3 "$tmp/manifest" > "$manifest"
+}
+
+cmd_ignore() {
+	[ $# -ge 1 ] || die "usage: dsam ignore <glob>..."
+	touch "$here/ignore.list"
+	for pat; do
+		has "$pat" "$here/ignore.list" || printf '%s\n' "$pat" >> "$here/ignore.list"
+	done
+}
+
+# ---------- dispatch ----------
+
+cmd=${1:-}
+if [ $# -gt 0 ]; then shift; fi
+case $cmd in
+	install) cmd_install "$@" ;;
+	config) cmd_config "$@" ;;
+	diff) cmd_diff "$@" ;;
+	info) cmd_info "$@" ;;
+	track) cmd_track "$@" ;;
+	ignore) cmd_ignore "$@" ;;
+	*) die "usage: dsam <install|config|diff|info|track|ignore> [args]" ;;
+esac
