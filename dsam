@@ -164,10 +164,9 @@ cmd_update() {
 
 # ---------- config ----------
 
-cmdconfig()	if is_custom "$1"; then kv source: "packages/$1 (built)"
-	elif has_dir "$1"; then kv source: "packages/$1 (dotfiles overlay)"
-	fi:]]*(#|$)'
-	 "$manifest" | while read -r mode own path; do
+cmd_config() {
+	if [ -f "$manifest" ]; then
+		grep -Ev '^[[:space:]]*(#|$)' "$manifest" | while read -r mode own path; do
 			as_root install -D -m "$mode" -o "${own%%:*}" -g "${own#*:}" \
 				-- "$pdir/files$path" "$path" < /dev/null
 		done
