@@ -1,0 +1,177 @@
+# ~/.config/helix/themes/border.toml
+# :theme border
+
+inherits = "default"
+
+# ---------- UI ----------
+"ui.background" = { bg = "bg" }
+"ui.window" = { fg = "border" }
+"ui.text" = { fg = "fg" }
+"ui.text.focus" = { fg = "fg", bg = "sel" }
+"ui.text.info" = { fg = "fg2", bg = "bg_window" }
+
+"ui.cursor" = { fg = "bg", bg = "fg2" }
+"ui.cursor.primary" = { fg = "bg", bg = "fg" }
+"ui.cursor.match" = { fg = "pink", modifiers = ["bold", "underlined"] }
+"ui.cursor.primary.insert" = { fg = "bg", bg = "green" }
+"ui.cursor.primary.select" = { fg = "bg", bg = "magenta" }
+"ui.cursorline.primary" = { bg = "halo" }
+"ui.cursorcolumn.primary" = { bg = "halo" }
+
+"ui.selection" = { bg = "tab" }
+"ui.selection.primary" = { bg = "tab_hi" }
+
+"ui.linenr" = { fg = "faint" }
+"ui.linenr.selected" = { fg = "fg2", bg = "halo" }
+"ui.gutter" = { bg = "bg" }
+"ui.gutter.selected" = { bg = "halo" }
+"ui.virtual.whitespace" = { fg = "faint" }
+"ui.virtual.indent-guide" = { fg = "border" }
+"ui.virtual.ruler" = { bg = "bg_window" }
+"ui.virtual.inlay-hint" = { fg = "muted" }
+"ui.virtual.jump-label" = { fg = "pink", modifiers = ["bold"] }
+"ui.highlight" = { bg = "sel" }
+
+"ui.statusline" = { fg = "fg2", bg = "bg_window" }
+"ui.statusline.inactive" = { fg = "muted", bg = "bg_window" }
+"ui.statusline.normal" = { fg = "white", bg = "accent", modifiers = ["bold"] }
+"ui.statusline.insert" = { fg = "bg", bg = "green", modifiers = ["bold"] }
+"ui.statusline.select" = { fg = "bg", bg = "magenta", modifiers = ["bold"] }
+"ui.statusline.separator" = { fg = "border" }
+
+"ui.bufferline" = { fg = "muted", bg = "bg_window" }
+"ui.bufferline.active" = { fg = "fg", bg = "tab", modifiers = ["bold"] }
+"ui.bufferline.background" = { bg = "bg_window" }
+
+"ui.popup" = { fg = "fg", bg = "bg" }
+"ui.popup.info" = { fg = "fg", bg = "bg" }
+"ui.help" = { fg = "fg", bg = "bg" }
+"ui.menu" = { fg = "fg2", bg = "bg" }
+"ui.menu.selected" = { fg = "fg", bg = "sel" }
+"ui.menu.scroll" = { fg = "muted", bg = "bg" }
+"ui.picker.header" = { fg = "violet", modifiers = ["bold"] }
+"ui.picker.header.column" = { fg = "muted" }
+"ui.picker.header.column.active" = { fg = "violet", modifiers = ["bold"] }
+
+# ---------- Diagnostics ----------
+"diagnostic.error" = { underline = { style = "curl", color = "red" } }
+"diagnostic.warning" = { underline = { style = "curl", color = "orange" } }
+"diagnostic.info" = { underline = { style = "curl", color = "sky" } }
+"diagnostic.hint" = { underline = { style = "curl", color = "green" } }
+"diagnostic.unnecessary" = { modifiers = ["dim"] }
+"diagnostic.deprecated" = { modifiers = ["crossed_out"] }
+"error" = { fg = "red" }
+"warning" = { fg = "orange" }
+"info" = { fg = "sky" }
+"hint" = { fg = "green" }
+
+# ---------- Diff ----------
+"diff.plus" = { fg = "green" }
+"diff.minus" = { fg = "pink" }
+"diff.delta" = { fg = "sky" }
+"diff.delta.moved" = { fg = "violet" }
+
+# ---------- Syntax ----------
+"comment" = { fg = "comment", modifiers = ["italic"] }
+"comment.block.documentation" = { fg = "comment_doc", modifiers = ["italic"] }
+
+"keyword" = { fg = "pink" }
+"keyword.control" = { fg = "pink" }
+"keyword.control.import" = { fg = "pink" }
+"keyword.directive" = { fg = "violet" }
+"keyword.storage" = { fg = "pink" }
+"keyword.operator" = { fg = "pink" }
+"keyword.function" = { fg = "pink" }
+
+"operator" = { fg = "pink" }
+"punctuation" = { fg = "fg2" }
+"punctuation.delimiter" = { fg = "muted" }
+"punctuation.bracket" = { fg = "fg2" }
+
+"function" = { fg = "green" }
+"function.macro" = { fg = "cyan" }
+"function.builtin" = { fg = "green", modifiers = ["italic"] }
+"function.method" = { fg = "green" }
+"constructor" = { fg = "cyan" }
+
+"type" = { fg = "cyan" }
+"type.builtin" = { fg = "cyan", modifiers = ["italic"] }
+"type.enum.variant" = { fg = "violet" }
+"namespace" = { fg = "sky" }
+"special" = { fg = "magenta" }
+"label" = { fg = "magenta" }
+
+"variable" = { fg = "fg" }
+"variable.builtin" = { fg = "violet", modifiers = ["italic"] }
+"variable.parameter" = { fg = "orange", modifiers = ["italic"] }
+"variable.other.member" = { fg = "fg2" }
+
+"constant" = { fg = "orange" }
+"constant.builtin" = { fg = "violet" }
+"constant.numeric" = { fg = "violet" }
+"constant.character.escape" = { fg = "magenta" }
+
+"string" = { fg = "yellow" }
+"string.regexp" = { fg = "orange" }
+"string.special" = { fg = "sky" }
+"string.special.path" = { fg = "sky" }
+"string.special.url" = { fg = "blue", modifiers = ["underlined"] }
+
+"attribute" = { fg = "green" }
+"tag" = { fg = "pink" }
+"embedded" = { fg = "fg" }
+
+# ---------- Markup ----------
+"markup.heading" = { fg = "violet", modifiers = ["bold"] }
+"markup.heading.marker" = { fg = "muted" }
+"markup.heading.1" = { fg = "magenta", modifiers = ["bold"] }
+"markup.heading.2" = { fg = "violet", modifiers = ["bold"] }
+"markup.heading.3" = { fg = "blue", modifiers = ["bold"] }
+"markup.heading.4" = { fg = "sky", modifiers = ["bold"] }
+"markup.heading.5" = { fg = "cyan", modifiers = ["bold"] }
+"markup.heading.6" = { fg = "green", modifiers = ["bold"] }
+"markup.list" = { fg = "magenta" }
+"markup.bold" = { fg = "fg", modifiers = ["bold"] }
+"markup.italic" = { fg = "fg", modifiers = ["italic"] }
+"markup.strikethrough" = { modifiers = ["crossed_out"] }
+"markup.link.url" = { fg = "blue", modifiers = ["underlined"] }
+"markup.link.text" = { fg = "sky" }
+"markup.link.label" = { fg = "sky" }
+"markup.quote" = { fg = "muted", modifiers = ["italic"] }
+"markup.raw" = { fg = "yellow" }
+"markup.raw.block" = { fg = "fg2" }
+
+# ---------- Rainbow brackets ----------
+rainbow = ["blue", "magenta", "green", "pink", "sky", "violet"]
+
+# ---------- Palette ----------
+[palette]
+bg_window = "#262229"
+bg = "#201c24"
+halo = "#27232b"
+border = "#362c3f"
+sel = "#322c37"
+tab = "#382844"
+tab_hi = "#433450"
+
+fg = "#d6cfdc"
+fg2 = "#bfb6c6"
+muted = "#80738a"
+faint = "#4b4252"
+status = "#8c6ca5"
+accent = "#8930d7"
+white = "#ffffff"
+
+green = "#53eda2"
+cyan = "#52e0e8"
+sky = "#55b5f8"
+blue = "#457bf3"
+violet = "#9348f8"
+magenta = "#c853ec"
+pink = "#e4509a"
+red = "#ff5555"
+orange = "#ffb86c"
+yellow = "#f1fa8c"
+
+comment = "#6272a4"
+comment_doc = "#7b86b3"

@@ -1,0 +1,25 @@
+theme = "border"
+
+[editor]
+line-number = "relative"
+cursorline = true
+color-modes = true
+bufferline = "multiple"
+true-color = true
+
+[editor.soft-wrap]
+enable = true
+wrap-indicator = "↪ "
+
+[editor.cursor-shape]
+insert = "bar"
+normal = "block"
+select = "underline"
+
+[editor.indent-guides]
+render = true
+character = "┊"
+
+[editor.lsp]
+display-messages = true
+display-inlay-hints = false
