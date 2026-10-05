@@ -1,0 +1,5 @@
+[source.crates-io]
+replace-with = "iranserver"
+
+[source.iranserver]
+registry = "sparse+https://cargo.iranserver.com/repository/cargo/"
