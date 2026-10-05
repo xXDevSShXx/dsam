@@ -17,6 +17,13 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$here/profiles/$profile/profile.conf"
 
+: "${HOST_NAME:?}" "${TIMEZONE:?}" "${LOCALE:?}" "${ESP_SIZE:?}" "${ROOT_SIZE:?}" "${SWAP:?}"
+[ -e "/usr/share/zoneinfo/$TIMEZONE" ] || die "unknown timezone: $TIMEZONE"
+grep -q "^#*$LOCALE UTF-8" /etc/locale.gen || die "unknown locale: $LOCALE"
+
+live=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+case $live in "$disk"*) die "$disk holds the live medium" ;; esac
+
 case $SWAP in
 	none|zram|hibernate) ;;
 	*) die "bad SWAP: $SWAP" ;;
@@ -28,7 +35,9 @@ read -r answer
 [ "$answer" = "$disk" ] || die "aborted"
 printf 'Username: '
 read -r username
-[ -n "$username" ] || die "empty username"
+case $username in
+	''|[!a-z_]*|*[!a-z0-9_-]*) die "invalid username: $username" ;;
+esac
 
 case $disk in
 	*[0-9]) p=${disk}p ;;

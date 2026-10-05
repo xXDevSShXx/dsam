@@ -48,6 +48,8 @@ if ! command -v paru > /dev/null 2>&1; then
 fi
 link_dotfiles paru
 
+[ "$here" = "$HOME/dsam" ] || warn "repo is not at ~/dsam, so paru.conf's Path will not find packages/"
+
 say "packages"
 if [ -f "$pdir/packages.txt" ]; then
 	# shellcheck disable=SC2046

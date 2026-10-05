@@ -4,7 +4,7 @@ set -eu
 host=$1 tz=$2 locale=$3 swap=$4 root_uuid=$5 swap_uuid=$6 user=$7
 
 ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
-hwclock --systohc
+hwclock --systohc || printf 'warning: no hardware clock, skipping\n' >&2
 
 sed -i "s/^#\($locale UTF-8\)/\1/" /etc/locale.gen
 locale-gen
@@ -53,4 +53,4 @@ useradd -m -G wheel "$user"
 until passwd "$user"; do :; done
 passwd -l root
 
-systemctl enable NetworkManager systemd-timesyncd fstrim.timer
+systemctl enable NetworkManager systemd-timesyncd fstrim.timer systemd-boot-update.service

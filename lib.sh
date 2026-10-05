@@ -1,3 +1,5 @@
+# shellcheck shell=sh disable=SC2154,SC2034
+
 # shared by dsam and configure.sh; the caller sets $here (repo root) first.
 # packages/<name>/ holds a PKGBUILD, an optional post-install.sh (run as the
 # user) and an optional .dotfiles/ tree (mirrors ~/, symlinked into place).
@@ -75,23 +77,6 @@ run_hook() {
 	fi
 }
 
-# build and install packages/<name> when the installed version differs from the
-# PKGBUILD (upgrade or downgrade), then link its dotfiles and run its hook
-custom_sync() {
-	dir=$here/packages/$1
-	if grep -q '^pkgver()' "$dir/PKGBUILD"; then
-		pacman -Qq -- "$1" > /dev/null 2>&1 || aur -Bi "$dir"
-	else
-		want=$(srcinfo_version "$1")
-		have=$(installed_version "$1")
-		if [ -z "$have" ] || [ "$(vercmp "$have" "$want")" -ne 0 ]; then
-			aur -Bi "$dir"
-		fi
-	fi
-	link_dotfiles "$1"
-	run_hook "$1"
-}
-
 # packages/<name> may build a package (PKGBUILD) and/or carry .dotfiles and a hook
 sync_package() {
 	dir=$here/packages/$1
@@ -110,9 +95,11 @@ sync_package() {
 	run_hook "$1"
 }
 
-# 
+
 # pkg_install <name>...
-# names with a packages/<name>/PKGBUILD are built from it, the rest come from paru
+# PKGBUILD directories are built, everything else comes from paru; any
+# packages/<name> directory then gets its dotfiles linked and its hook run.
+# Declared packages are marked explicit so they never look like orphans.
 pkg_install() {
 	sync_srcinfo
 	repo=
@@ -123,8 +110,10 @@ pkg_install() {
 	# shellcheck disable=SC2086
 	if [ -n "$repo" ]; then aur -S --needed $repo; fi
 	for p; do
-		if is_custom "$p"; then custom_sync "$p"; fi
+		if has_dir "$p"; then sync_package "$p"; fi
+		if pacman -Qdq -- "$p" > /dev/null 2>&1; then
+			as_root pacman -D --asexplicit -- "$p" > /dev/null
+		fi
 	done
 }
-
 
