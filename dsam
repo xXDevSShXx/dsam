@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 devssh
 # dsam: DSam system manager. See `dsam help` and `dsam man`.
 set -euo pipefail
 export LC_ALL=C
@@ -829,6 +831,8 @@ dsam info ~/.cargo/config.toml
 dsam info sway
 dsam help packages            # just the PACKAGES section
 .fi
+.SH LICENSE
+GPL\-3.0\-or\-later. Copyright (C) 2026 devssh. Files that state a different license in their header keep it.
 ROFF
 }
 
