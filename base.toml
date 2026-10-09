@@ -1,0 +1,11 @@
+packages = [
+  "base",
+  "base-devel",
+  "git",
+  "helix",
+  "linux",
+  "linux-firmware",
+  "networkmanager",
+  "opendoas",
+  "tomli-bin",
+]
