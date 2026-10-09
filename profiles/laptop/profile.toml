@@ -1,0 +1,18 @@
+[machine]
+host_name = "dsaml"
+timezone = "Asia/Tehran"
+locale = "en_US.UTF-8"
+esp_size = "1G"
+root_size = "80G"
+swap = "hibernate"
+
+# Charging needs no package. Optional battery care: "tlp" (+ enable "tlp.service" below).
+[packages]
+list = [
+  "brightnessctl",
+]
+exclude = []
+ignore = []
+
+[services]
+enable = []

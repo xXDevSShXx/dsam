@@ -7,7 +7,11 @@ VERSION=1.0.0
 DRY=0
 RC=0
 DIFF_RC=0
-DSAM_DIR=${DSAM_DIR:-$HOME/dsam}
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+if [[ -z ${DSAM_DIR-} ]]; then
+	DSAM_DIR=${SELF%/*}
+	[[ -d $DSAM_DIR/packages ]] || DSAM_DIR=$HOME/dsam
+fi
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/dsam
 BASE_TOML="" PROFILE="" PROFILE_TOML=""
 
@@ -29,6 +33,7 @@ need() { local c; for c; do command -v "$c" >/dev/null 2>&1 || die "missing depe
 run()  { if ((DRY)); then printf '%s[dry]%s %s\n' "$CW" "$C0" "$*" >&2; else "$@"; fi; }
 lines() { if [[ -n $1 ]]; then printf '%s\n' "$1"; fi; }
 has()  { grep -xF -- "$1" >/dev/null; }
+aur()  { paru --sudo doas "$@"; }
 
 guard() {
 	if ((EUID == 0)) || [[ -n ${SUDO_USER-}${DOAS_USER-} ]]; then
@@ -69,6 +74,10 @@ ensure_tomli() {
 # all strings of an array key, one per line (empty if the key is missing)
 tlist() { { tomli query -f "$1" "$2" 2>/dev/null || true; } | { grep -o '"[^"]*"' || true; } | sed 's/^"//; s/"$//'; }
 
+# one string value (quotes and tomli's leading space removed)
+tstr() { local v; v=$(tomli query -f "$1" "$2" 2>/dev/null) || return 1; v=${v# }; v=${v#\"}; v=${v%\"}; printf '%s\n' "$v"; }
+tcfg() { tstr "$PROFILE_TOML" "machine.$1" || die "missing [machine] $1 in $PROFILE_TOML"; }
+
 # rewrite `key = [...]` inside [table] ("" = top level) with the contents of blockfile
 awk_replace() { # file table key blockfile
 	awk -v table="$2" -v key="$3" -v blk="$4" '
@@ -101,23 +110,20 @@ load_repo() {
 	ensure_tomli
 }
 
-ensure_paru_repo() {
-	if ((DRY)); then return 0; fi
-	local conf=${PARU_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/paru/paru.conf} want=$DSAM_DIR/packages
-	if [[ ! -e $conf ]]; then
-		mkdir -p "${conf%/*}"
-		if [[ -r /etc/paru.conf ]]; then cp /etc/paru.conf "$conf"; else : >"$conf"; fi
-	fi
-	if grep -x '\[dsam\]' "$conf" >/dev/null; then
-		grep -xF "Path = $want" "$conf" >/dev/null || warn "[dsam] in $conf does not point at $want"
-	else
-		printf '\n[dsam]\nPath = %s\nGenerateSrcinfo\n' "$want" >>"$conf"
-		msg "added [dsam] PKGBUILD repo to $conf"
-	fi
+# base.toml minus the profile's [packages] exclude
+base_list() { tlist "$BASE_TOML" packages | { grep -vxFf <(tlist "$PROFILE_TOML" packages.exclude) || true; }; }
+
+check_exclude() {
+	local x
+	while read -r x; do
+		[[ -n $x ]] || continue
+		tlist "$BASE_TOML" packages | has "$x" || warn "exclude \"$x\" is not in base.toml"
+	done < <(tlist "$PROFILE_TOML" packages.exclude)
 	return 0
 }
 
-declared_raw() { tlist "$BASE_TOML" packages; tlist "$PROFILE_TOML" packages.list; }
+# effective declared set: (base.toml - exclude) + list
+declared_raw() { base_list; tlist "$PROFILE_TOML" packages.list; }
 
 # declared names with groups expanded to their members, sorted
 declared() {
@@ -153,62 +159,85 @@ is_custom() { [[ -f $DSAM_DIR/packages/$1/PKGBUILD ]]; }
 inst_ver()  { pacman -Q "$1" 2>/dev/null | cut -d' ' -f2 || true; }
 
 # [epoch:]pkgver-pkgrel of a custom package, or "?" for VCS packages (pkgver() function)
-pb_ver() (
-	set +u
-	cd "$DSAM_DIR/packages/$1"
-	source ./PKGBUILD
-	if declare -F pkgver >/dev/null; then echo "?"; exit 0; fi
-	v=$pkgver-${pkgrel:-1}
-	if [[ ${epoch:-0} != 0 ]]; then v=$epoch:$v; fi
-	echo "$v"
-)
+
+has_dir() { [[ -d $DSAM_DIR/packages/$1 ]]; }
+
+# .SRCINFO is generated, never committed; paru's PKGBUILD repo and the version check read it
+sync_srcinfo() {
+	local d
+	for d in "$DSAM_DIR"/packages/*/; do
+		[[ -f ${d}PKGBUILD ]] || continue
+		if [[ ! -f ${d}.SRCINFO || ${d}PKGBUILD -nt ${d}.SRCINFO ]]; then
+			(cd "$d" && makepkg --printsrcinfo >.SRCINFO.new && mv .SRCINFO.new .SRCINFO)
+		fi
+	done
+	return 0
+}
+
+# [epoch:]pkgver-pkgrel from .SRCINFO, or "?" for VCS packages (pkgver() function)
+pb_ver() {
+	local d=$DSAM_DIR/packages/$1
+	if grep '^pkgver()' "$d/PKGBUILD" >/dev/null; then echo "?"; return 0; fi
+	awk -F' = ' '/^\tepoch =/ { e = $2 } /^\tpkgver =/ { v = $2 } /^\tpkgrel =/ { r = $2 } END { print (e != "" ? e ":" : "") v "-" r }' "$d/.SRCINFO"
+}
+
 
 link_dotfiles() {
-	local d=$DSAM_DIR/packages/$1
-	[[ -d $d/.dotfiles ]] || return 0
-	need stow
-	if ((DRY)); then
-		stow -n -v --no-folding -d "$d" -t "$HOME" .dotfiles 2>&1 | sed 's/^/  /' >&2 || true
-	else
-		stow --no-folding -d "$d" -t "$HOME" .dotfiles ||
-			die "$1: dotfile conflict (a real file already exists in \$HOME?); move it away and rerun"
-	fi
+	local src=$DSAM_DIR/packages/$1/.dotfiles f dest want cur
+	[[ -d $src ]] || return 0
+	while IFS= read -r f; do
+		dest=$HOME/$f want=$src/$f
+		if [[ -L $dest ]]; then
+			cur=$(readlink -- "$dest")
+			[[ $cur == "$want" ]] && continue
+			if [[ $cur == "$DSAM_DIR"/packages/* ]]; then run ln -sfn -- "$want" "$dest"; continue; fi
+		fi
+		if [[ -e $dest || -L $dest ]]; then
+			warn "conflict, not overwriting: $dest"
+			RC=1
+			continue
+		fi
+		run mkdir -p "$(dirname "$dest")"
+		run ln -s -- "$want" "$dest"
+	done < <(cd "$src" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort)
 	return 0
 }
 
 post_install() {
 	local d=$DSAM_DIR/packages/$1
-	[[ -f $d/post-install.sh ]] || return 0
+	[[ -x $d/post-install.sh ]] || return 0
 	step "$1: post-install.sh"
-	(cd "$d" && run bash ./post-install.sh) || { warn "$1: post-install.sh failed"; RC=1; }
+	(cd "$d" && run ./post-install.sh) || { warn "$1: post-install.sh failed"; RC=1; }
 	return 0
 }
 
-custom_apply() { # name [installed-version-before]
-	local p=$1 pre iv rv act ch=0
+
+sync_dir() { # name [installed-version-before]; the PKGBUILD is optional
+	local p=$1 pre iv rv act=current ch=0
 	pre=${2-$(inst_ver "$p")}
 	iv=$(inst_ver "$p")
-	rv=$(pb_ver "$p")
-	if [[ -z $iv ]]; then act=install
-	elif [[ $rv == '?' ]]; then act=current
-	else
-		case $(vercmp "$rv" "$iv") in
-			1) act=upgrade ;;
-			0) act=current ;;
-			*) act=downgrade ;;
+	if is_custom "$p"; then
+		rv=$(pb_ver "$p")
+		if [[ -z $iv ]]; then act=install
+		elif [[ $rv == '?' ]]; then act=current
+		else
+			case $(vercmp "$rv" "$iv") in
+				1) act=upgrade ;;
+				0) act=current ;;
+				*) act=downgrade ;;
+			esac
+		fi
+		case $act in
+			install | upgrade | downgrade)
+				step "$p: $act ${iv:+$iv -> }$rv"
+				run aur -Bi "$DSAM_DIR/packages/$p"
+				;;
+			current) msg "$p: up to date (${iv:-?})" ;;
 		esac
 	fi
-	case $act in
-		install | upgrade | downgrade)
-			step "$p: $act ${iv:+$iv -> }$rv"
-			if [[ $act == downgrade ]]; then warn "$p: downgrade; 'paru -Syu' would skip this, installing explicitly"; fi
-			run paru -S "$p"
-			;;
-		current) msg "$p: up to date (${iv:-?})" ;;
-	esac
 	link_dotfiles "$p"
 	if ((DRY)); then
-		if [[ $act != current ]]; then ch=1; fi
+		if [[ $act != current || -z $pre ]]; then ch=1; fi
 	elif [[ $(inst_ver "$p") != "$pre" ]]; then
 		ch=1
 	fi
@@ -216,74 +245,90 @@ custom_apply() { # name [installed-version-before]
 	return 0
 }
 
-installed_customs() {
+
+installed_dirs() {
 	local d p
-	for d in "$DSAM_DIR"/packages/*/PKGBUILD; do
-		[[ -e $d ]] || continue
-		p=${d%/PKGBUILD}; p=${p##*/}
+	for d in "$DSAM_DIR"/packages/*/; do
+		[[ -d $d ]] || continue
+		p=${d%/}; p=${p##*/}
 		if [[ -n $(inst_ver "$p") ]]; then printf '%s\n' "$p"; fi
 	done
 }
 
 # ---------------------------------------------------------------- commands
 
+
 cmd_install() {
-	load_repo; need paru pacman vercmp; ensure_paru_repo
-	local pkgs=("$@") p
+	load_repo; need paru pacman vercmp makepkg doas; sync_srcinfo
+	local pkgs=("$@") p pre
 	if ((${#pkgs[@]} == 0)); then
 		mapfile -t pkgs < <(comm -23 <(declared) <(pacman -Qq | sort -u))
 		if ((${#pkgs[@]} == 0)); then msg "nothing to install: every declared package is present"; return 0; fi
 	fi
 	for p in "${pkgs[@]}"; do
+		pre=$(inst_ver "$p")
 		if is_custom "$p"; then
-			custom_apply "$p"
+			sync_dir "$p" "$pre"
 		else
 			step "$p"
-			run paru -S "$p"
+			run aur -S --needed "$p"
+			if has_dir "$p"; then sync_dir "$p" "$pre"; fi
 		fi
 		if ((DRY)); then
 			add_declared "$p"
 		elif pacman -Qq "$p" >/dev/null 2>&1 || [[ -n $(pacman -Qqg "$p" 2>/dev/null || true) ]]; then
 			add_declared "$p"
+			if pacman -Qdq -- "$p" >/dev/null 2>&1; then doas pacman -D --asexplicit -- "$p" >/dev/null; fi
 		else
 			warn "$p is not an installed package name; not recorded in the profile"
 		fi
 	done
-	return 0
-}
-
-cmd_update() {
-	load_repo; need paru pacman vercmp; ensure_paru_repo
-	local ign p args=()
-	declare -A pre=()
-	local customs=()
-	ign=$(tlist "$PROFILE_TOML" packages.ignore | paste -sd,)
-	if [[ -n $ign ]]; then args=(--ignore "$ign"); fi
-	mapfile -t customs < <(installed_customs)
-	for p in "${customs[@]}"; do pre[$p]=$(inst_ver "$p"); done
-	step "paru -Syu${ign:+ (ignoring $ign)}"
-	run paru -Syu "${args[@]}"
-	for p in "${customs[@]}"; do custom_apply "$p" "${pre[$p]}"; done
 	return "$RC"
 }
 
+
+cmd_update() {
+	load_repo; need paru pacman vercmp makepkg; sync_srcinfo
+	local ign p args=() customs=()
+	declare -A pre=()
+	ign=$(tlist "$PROFILE_TOML" packages.ignore | paste -sd,)
+	if [[ -n $ign ]]; then args=(--ignore "$ign"); fi
+	mapfile -t customs < <(installed_dirs)
+	for p in "${customs[@]}"; do pre[$p]=$(inst_ver "$p"); done
+	step "paru -Syu${ign:+ (ignoring $ign)}"
+	run aur -Syu "${args[@]}"
+	for p in "${customs[@]}"; do sync_dir "$p" "${pre[$p]}"; done
+	return "$RC"
+}
+
+
 cmd_config() {
 	load_repo; need pacman
-	ensure_paru_repo
 	local p s
 	while read -r p; do
 		[[ -n $p ]] || continue
 		link_dotfiles "$p"
-	done < <(installed_customs)
+	done < <(installed_dirs)
 	while read -r s; do
 		[[ -n $s ]] || continue
-		if systemctl is-enabled --quiet "$s" 2>/dev/null && systemctl is-active --quiet "$s" 2>/dev/null; then
-			msg "service $s: enabled and active"
-		else
-			need doas systemctl
-			step "service $s: enable --now"
-			run doas systemctl enable --now "$s"
-		fi
+		case $s in
+			user:*)
+				s=${s#user:}
+				if systemctl --user is-enabled --quiet "$s" 2>/dev/null; then
+					msg "user service $s: enabled"
+				else
+					step "user service $s: enable"
+					run systemctl --user enable "$s"
+				fi ;;
+			*)
+				if systemctl is-enabled --quiet "$s" 2>/dev/null && systemctl is-active --quiet "$s" 2>/dev/null; then
+					msg "service $s: enabled and active"
+				else
+					need doas systemctl
+					step "service $s: enable --now"
+					run doas systemctl enable --now "$s"
+				fi ;;
+		esac
 	done < <(tlist "$PROFILE_TOML" services.enable)
 	return "$RC"
 }
@@ -299,6 +344,7 @@ cmd_diff() {
 	local deps=0 dec inst expl miss extra asdep orph stray="" clo x
 	if [[ ${1-} == --deps ]]; then deps=1; elif (($# > 0)); then die "usage: dsam diff [--deps]"; fi
 	load_repo; need pacman
+	check_exclude
 	dec=$(declared)
 	inst=$(pacman -Qq | sort -u)
 	expl=$({ pacman -Qqe || true; } | sort -u)
@@ -331,8 +377,9 @@ info_pkg() {
 		if is_custom "$p"; then printf 'source:    custom (packages/%s)\n' "$p"; fi
 		return 0
 	fi
-	if tlist "$BASE_TOML" packages | has "$p"; then cls="first-class (base)"
+	if base_list | has "$p"; then cls="first-class (base)"
 	elif tlist "$PROFILE_TOML" packages.list | has "$p"; then cls="first-class (profile $PROFILE)"
+	elif tlist "$PROFILE_TOML" packages.exclude | has "$p"; then cls="undeclared (excluded from base by profile $PROFILE)"
 	elif { pacman -Qqd || true; } | has "$p"; then cls="second-class (installed as dependency)"
 	else cls="undeclared (explicitly installed)"; fi
 	if is_custom "$p"; then src="custom (packages/$p)"
@@ -351,7 +398,7 @@ info_path() {
 		case $link in
 			"$DSAM_DIR"/packages/*/.dotfiles/*)
 				pkg=${link#"$DSAM_DIR"/packages/}; pkg=${pkg%%/*}
-				printf 'type:      dotfile\nowner:     %s (dsam custom package, linked by stow)\n' "$pkg"
+				printf 'type:      dotfile\nowner:     %s (dsam package directory, symlinked)\n' "$pkg"
 				return 0 ;;
 		esac
 	fi
@@ -376,6 +423,181 @@ cmd_info() {
 	esac
 }
 
+# ---------------------------------------------------------------- base / setup
+
+cmd_base() { # dsam base <profile> <disk>: ISO phase, root
+	(($# == 2)) || die "usage: dsam base <profile> <disk>"
+	local profile=$1 disk=$2 host tz loc swap esp rootsz username answer p x
+	local swap_part="" home_part esp_part root_part swap_uuid="" root_uuid ram_mib
+	local extra=() pkgs=()
+	[[ -d /run/archiso ]] || die "base must be run from the Arch ISO"
+	((EUID == 0)) || die "base must run as root"
+	[[ -d /sys/firmware/efi ]] || die "UEFI required"
+	[[ -b $disk ]] || die "not a block device: $disk"
+	need sgdisk pacstrap arch-chroot genfstab mkfs.fat mkfs.ext4 lsblk blkid partprobe
+	BASE_TOML=$DSAM_DIR/base.toml PROFILE=$profile PROFILE_TOML=$DSAM_DIR/profiles/$profile/profile.toml
+	[[ -r $BASE_TOML ]] || die "missing $BASE_TOML"
+	[[ -r $PROFILE_TOML ]] || die "unknown profile: $profile"
+	ensure_tomli
+	check_exclude
+	host=$(tcfg host_name)
+	tz=$(tcfg timezone)
+	loc=$(tcfg locale)
+	swap=$(tcfg swap)
+	esp=$(tcfg esp_size)
+	rootsz=$(tcfg root_size)
+	case $swap in none | zram | hibernate) ;; *) die "bad [machine] swap: $swap" ;; esac
+
+	lsblk -o NAME,SIZE,MODEL,MOUNTPOINTS "$disk"
+	read -r -p "This ERASES $disk. Type the device path to continue: " answer
+	[[ $answer == "$disk" ]] || die "aborted"
+	read -r -p "Username: " username
+	[[ $username =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid username: $username"
+
+	case $disk in *[0-9]) p=${disk}p ;; *) p=$disk ;; esac
+	swapoff -a
+	umount -R /mnt 2>/dev/null || true
+	wipefs -af "$disk"
+	sgdisk --zap-all "$disk"
+	sgdisk -n "1:0:+$esp" -t 1:ef00 -c 1:esp "$disk"
+	sgdisk -n "2:0:+$rootsz" -t 2:8304 -c 2:root "$disk"
+	if [[ $swap == hibernate ]]; then
+		ram_mib=$(awk '/^MemTotal:/ { print int(($2 + 1023) / 1024) }' /proc/meminfo)
+		sgdisk -n "3:0:+${ram_mib}M" -t 3:8200 -c 3:swap "$disk"
+		sgdisk -n 4:0:0 -t 4:8302 -c 4:home "$disk"
+		swap_part=${p}3
+		home_part=${p}4
+	else
+		sgdisk -n 3:0:0 -t 3:8302 -c 3:home "$disk"
+		home_part=${p}3
+	fi
+	esp_part=${p}1
+	root_part=${p}2
+	partprobe "$disk"
+	udevadm settle
+
+	mkfs.fat -F32 -n ESP "$esp_part"
+	mkfs.ext4 -F -L root "$root_part"
+	mkfs.ext4 -F -L home "$home_part"
+	mount "$root_part" /mnt
+	mkdir -p /mnt/boot /mnt/home
+	mount -o umask=0077 "$esp_part" /mnt/boot
+	mount "$home_part" /mnt/home
+	if [[ $swap == hibernate ]]; then
+		mkswap -L swap "$swap_part"
+		swapon "$swap_part"
+		swap_uuid=$(blkid -s UUID -o value "$swap_part")
+	fi
+	root_uuid=$(blkid -s UUID -o value "$root_part")
+
+	case $(awk -F': ' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo) in
+		GenuineIntel) extra+=(intel-ucode) ;;
+		AuthenticAMD) extra+=(amd-ucode) ;;
+	esac
+	if [[ $swap == zram ]]; then extra+=(zram-generator); fi
+	while read -r x; do
+		[[ -n $x ]] || continue
+		[[ -f $DSAM_DIR/packages/$x/PKGBUILD ]] || pkgs+=("$x") # custom packages come later, via dsam install
+	done < <(base_list)
+
+	pacstrap -K /mnt "${pkgs[@]}" "${extra[@]}"
+	genfstab -U /mnt >/mnt/etc/fstab
+	install -m 0755 "$SELF" /mnt/root/dsam-chroot
+	arch-chroot /mnt /root/dsam-chroot _chroot "$host" "$tz" "$loc" "$swap" "$root_uuid" "$swap_uuid" "$username"
+	rm /mnt/root/dsam-chroot
+	mkdir -p /mnt/etc/dsam
+	printf '%s\n' "$profile" >/mnt/etc/dsam/profile
+	cp -a "$DSAM_DIR" "/mnt/home/$username/dsam"
+	arch-chroot /mnt chown -R "$username:" "/home/$username/dsam"
+	ln -sf "/home/$username/dsam/dsam" /mnt/usr/local/bin/dsam
+	swapoff -a
+	umount -R /mnt
+	msg "Done. Reboot into the new system, connect to the network and run: dsam setup"
+}
+
+cmd_chroot() { # hidden: runs inside arch-chroot
+	(($# == 7)) || die "internal command: dsam _chroot host tz locale swap root_uuid swap_uuid user"
+	local host=$1 tz=$2 loc=$3 swap=$4 root_uuid=$5 swap_uuid=$6 user=$7 options
+	ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+	hwclock --systohc || warn "no hardware clock, skipping"
+	sed -i "s/^#\($loc UTF-8\)/\1/" /etc/locale.gen
+	locale-gen
+	printf 'LANG=%s\n' "$loc" >/etc/locale.conf
+	printf '%s\n' "$host" >/etc/hostname
+	if [[ $swap == hibernate ]]; then
+		mkdir -p /etc/mkinitcpio.conf.d
+		cat >/etc/mkinitcpio.conf.d/dsam.conf <<'EOF'
+HOOKS=(base udev resume autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+EOF
+	fi
+	if [[ $swap == zram ]]; then
+		cat >/etc/systemd/zram-generator.conf <<'EOF'
+[zram0]
+zram-size = min(ram / 2, 4096)
+EOF
+	fi
+	mkinitcpio -P
+	bootctl install
+	mkdir -p /boot/loader/entries
+	cat >/boot/loader/loader.conf <<'EOF'
+default arch.conf
+timeout 3
+editor no
+EOF
+	options="root=UUID=$root_uuid rw"
+	if [[ -n $swap_uuid ]]; then options="$options resume=UUID=$swap_uuid"; fi
+	printf 'title Arch Linux\nlinux /vmlinuz-linux\ninitrd /initramfs-linux.img\noptions %s\n' "$options" >/boot/loader/entries/arch.conf
+	printf 'permit persist :wheel\n' >/etc/doas.conf
+	chmod 0400 /etc/doas.conf
+	doas -C /etc/doas.conf
+	useradd -m -G wheel "$user"
+	until passwd "$user"; do :; done
+	passwd -l root
+	systemctl enable NetworkManager systemd-timesyncd fstrim.timer systemd-boot-update.service
+}
+
+cmd_setup() { # dsam setup [profile]: first boot, or an already running Arch system
+	local profile=${1-} p build need_pkgs=()
+	[[ -f /etc/arch-release ]] || die "not Arch Linux"
+	need doas git makepkg
+	doas true || die "doas refused"
+	if [[ -z $profile ]]; then profile=$(cat /etc/dsam/profile 2>/dev/null || true); fi
+	[[ -n $profile ]] || die "usage: dsam setup <profile>"
+	[[ -f $DSAM_DIR/profiles/$profile/profile.toml ]] || die "unknown profile: $profile"
+	if [[ $(cat /etc/dsam/profile 2>/dev/null || true) != "$profile" ]]; then
+		doas mkdir -p /etc/dsam
+		printf '%s\n' "$profile" | doas tee /etc/dsam/profile >/dev/null
+	fi
+	if [[ ! -e /usr/local/bin/dsam ]]; then doas ln -s "$SELF" /usr/local/bin/dsam; fi
+
+	step "prerequisites"
+	for p in git base-devel; do
+		pacman -Qq "$p" >/dev/null 2>&1 || need_pkgs+=("$p")
+	done
+	if ((${#need_pkgs[@]})); then doas pacman -S --needed --noconfirm "${need_pkgs[@]}"; fi
+	if ! command -v paru >/dev/null 2>&1; then
+		step "building paru"
+		build=$CACHE/build
+		rm -rf "$build"
+		mkdir -p "$build"
+		git clone --depth 1 https://aur.archlinux.org/paru.git "$build/paru"
+		printf '. /etc/makepkg.conf\nPACMAN_AUTH=(doas)\n' >"$build/makepkg.conf"
+		(cd "$build/paru" && makepkg --config "$build/makepkg.conf" -s --noconfirm)
+		doas pacman -U --noconfirm "$build"/paru/paru-[0-9]*.pkg.tar.*
+		rm -rf "$build"
+	fi
+	link_dotfiles paru
+	if [[ $DSAM_DIR != "$HOME/dsam" ]]; then warn "repo is not at ~/dsam, so paru.conf's Path will not find packages/"; fi
+
+	step "packages"
+	cmd_install
+	step "config"
+	cmd_config
+	step "drift report"
+	cmd_diff || RC=1
+	return "$RC"
+}
+
 # ---------------------------------------------------------------- help
 
 topics() { roff | awk '/^\.SH/ { s = $0; sub(/^\.SH +/, "", s); gsub(/"/, "", s); print tolower(s) }'; }
@@ -385,6 +607,8 @@ usage() {
 dsam $VERSION: DSam system manager
 
 usage: dsam [-n] <command> [args]
+  base <profile> <disk>  ISO phase (root): partition, pacstrap, bootloader, user
+  setup [profile]        first boot: build paru, then install + config + diff
   install [pkg...]   install packages; no args: everything declared but missing
   update             paru -Syu, then reconcile custom packages
   config             link dotfiles of custom packages, enable services
@@ -433,6 +657,8 @@ roff() {
 dsam \- DSam system manager: declared packages, custom PKGBUILDs, dotfiles, services
 .SH SYNOPSIS
 .nf
+\fBdsam\fR \fBbase\fR \fIprofile\fR \fIdisk\fR
+\fBdsam\fR \fBsetup\fR [\fIprofile\fR]
 \fBdsam\fR [\fB\-n\fR] \fBinstall\fR [\fIpackage\fR...]
 \fBdsam\fR [\fB\-n\fR] \fBupdate\fR
 \fBdsam\fR [\fB\-n\fR] \fBconfig\fR
@@ -441,14 +667,20 @@ dsam \- DSam system manager: declared packages, custom PKGBUILDs, dotfiles, serv
 \fBdsam\fR \fBhelp\fR [\fItopic\fR]   \fBdsam\fR \fBman\fR [\fB\-\-install\fR]   \fBdsam\fR \fBfetch\-tomli\fR
 .fi
 .SH DESCRIPTION
-dsam keeps an Arch Linux system in line with two TOML files kept in a git repository: a base package list and a per\-machine profile.
-It does not reimplement anything: packages go through \fBparu\fR(8), dotfiles through \fBstow\fR(8), services through \fBsystemctl\fR(1), TOML through \fBtomli\fR.
-It never touches /etc (apart from enabling services and the optional man page install).
+dsam is the whole DSam implementation in one script: it installs the base system from the Arch ISO (\fBbase\fR), bootstraps the first boot (\fBsetup\fR) and keeps the system in line with two TOML files kept in a git repository: a base package list and a per\-machine profile.
+It does not reimplement anything: packages go through \fBparu\fR(8), dotfiles through plain per\-file symlinks, services through \fBsystemctl\fR(1), TOML through \fBtomli\fR.
+Apart from \fBbase\fR, it never edits /etc (it only enables services, writes /etc/dsam/profile in \fBsetup\fR and, optionally, installs the man page).
 Run it as your normal user; it calls \fBdoas\fR where root is needed and refuses to run as root or under sudo/doas.
 .PP
 Terms: a \fIfirst\-class\fR package is one you listed (base.toml or the profile). A \fIsecond\-class\fR package is a dependency pulled in by something else.
-A \fIcustom\fR package is one with a PKGBUILD in the repo's packages/ directory.
+A \fIpackage directory\fR is packages/<name>/; it may hold a PKGBUILD (a \fIcustom\fR package), a .dotfiles tree, a post\-install.sh, or any combination. A directory without a PKGBUILD only adds dotfiles and the hook to a package that comes from the repositories or the AUR.
 .SH COMMANDS
+.TP
+.B base profile disk
+Run from the Arch ISO, as root, from a clone of the repository. Reads [machine] from the profile, asks you to type the device path to confirm erasing it, asks for a username, then partitions (ESP, root, optional swap, /home taking the rest), formats, runs pacstrap with base.toml (packages that have a PKGBUILD are skipped; they are installed later), and runs the chroot stage (time zone, locale, hostname, initramfs, systemd\-boot, doas, the user and its password, locked root, NetworkManager and friends). It finally copies the repository to ~/dsam of the new user, writes /etc/dsam/profile and links dsam into /usr/local/bin.
+.TP
+.B setup [profile]
+First boot, or an already running Arch system. Records the profile in /etc/dsam/profile, installs git and base\-devel, builds paru from the AUR (using doas), links the paru package's dotfiles, then runs \fBinstall\fR, \fBconfig\fR and \fBdiff\fR. Safe to rerun.
 .TP
 .B install [package...]
 For each package: if packages/<name>/PKGBUILD exists it is a custom package, otherwise it is passed to paru (repositories and AUR).
@@ -459,7 +691,7 @@ With no arguments, installs everything declared but missing (use this on a fresh
 Runs \fBparu \-Syu\fR with the profile's \fB[packages] ignore\fR list, then reconciles every installed custom package: version change since before the update triggers post\-install.sh, a PKGBUILD older than the installed version is installed explicitly (downgrade), dotfiles are relinked.
 .TP
 .B config
-Relinks the dotfiles of every installed custom package and enables (\fBsystemctl enable \-\-now\fR) each unit in \fB[services] enable\fR that is not already enabled and active.
+Relinks the dotfiles of every installed package directory and enables (\fBsystemctl enable \-\-now\fR) each unit in \fB[services] enable\fR that is not already enabled and active. Entries prefixed with \fBuser:\fR are user units and are only enabled (\fBsystemctl \-\-user enable\fR).
 .TP
 .B diff [\-\-deps]
 Compares what is installed with what is declared. See \fBDIFF\fR. Exit status 1 when anything differs.
@@ -468,13 +700,20 @@ Compares what is installed with what is declared. See \fBDIFF\fR. Exit status 1 
 Version, class (base, profile, dependency, undeclared), source (custom, repository, foreign) and what requires it.
 .TP
 .B info path
-Which package owns the file (\fBpacman \-Qo\fR). Paths linked by stow from a custom package report that package. A path is anything containing a slash or starting with a dot.
+Which package owns the file (\fBpacman \-Qo\fR). Paths symlinked from a package directory report that package. A path is anything containing a slash or starting with a dot.
 .TP
 .B fetch\-tomli
 Downloads the tomli release pinned in packages/tomli\-bin/PKGBUILD, verifies its sha256, stores it in the cache directory and prints its path. Allowed as root so that base.sh can use it. Other commands do this automatically when tomli is not in PATH.
 .TP
 .B \-n, \-\-dry\-run
-For install, update and config: print the commands that would run (paru, stow \-n, doas, post\-install.sh) without running them or editing any file.
+For install, update and config: print the commands that would run (paru, doas, symlinks, post\-install.sh) without running them or editing any file.
+.SH INSTALL
+.nf
+1. Boot the Arch ISO, get network, clone the repository (git is on the ISO).
+2. ./dsam base laptop /dev/nvme0n1       # confirm the device, pick a user
+3. Reboot, log in, connect (nmtui), then:   dsam setup
+4. From now on: dsam install | update | config | diff | info
+.fi
 .SH LAYOUT
 .nf
 /etc/dsam/profile                 one line: the active profile name
@@ -498,20 +737,26 @@ packages = [
 .PP
 profiles/<name>/profile.toml:
 .nf
-[machine]            # read by base.sh, ignored by dsam
-swap = "zram"
+[machine]            # read by \fBdsam base\fR only
+host_name = "dsaml"
+timezone = "Asia/Tehran"
+locale = "en_US.UTF\-8"
+swap = "hibernate"   # none, zram or hibernate
+esp_size = "1G"
+root_size = "80G"
 
 [packages]
 list = [
   "helix",
 ]
+exclude = ["helix"]            # base.toml packages this profile does not want
 ignore = ["linux\-firmware"]   # passed to paru \-Syu \-\-ignore
 
 [services]
-enable = ["NetworkManager.service"]
+enable = ["NetworkManager.service", "user:foo.service"]
 .fi
 .PP
-Keys that are absent count as empty. \fBlist\fR must exist for \fBinstall\fR to record packages.
+The declared set of a profile is \fB(base.toml \- exclude) + list\fR: \fBexclude\fR drops base packages this profile does not want (\fBbase\fR skips them in pacstrap; \fBdiff\fR then reports them as extra if they are installed), \fBlist\fR adds packages, and a name in both stays declared. Excluding a name that is not in base.toml only warns. Keys that are absent count as empty. \fBlist\fR must exist for \fBinstall\fR to record packages. \fB[machine]\fR is read only by \fBbase\fR: sizes are sgdisk sizes, /home takes the rest of the disk, and \fBhibernate\fR adds a swap partition the size of RAM plus a resume= kernel option.
 .SH PACKAGES
 .SS Creating a package
 .nf
@@ -519,19 +764,19 @@ mkdir $DSAM_DIR/packages/foo
 $EDITOR $DSAM_DIR/packages/foo/PKGBUILD   # pkgname must equal the directory name
 dsam install foo
 .fi
-dsam adds a \fB[dsam]\fR PKGBUILD repository (\fBPath = $DSAM_DIR/packages\fR, \fBGenerateSrcinfo\fR) to paru's config on first use, so paru builds the package, resolves its dependencies (including AUR ones) and installs it. If the user paru.conf does not exist yet it is created as a copy of /etc/paru.conf. PKGBUILD repositories with Path are not reviewed by paru.
+dsam generates .SRCINFO next to each PKGBUILD (never commit it) and installs with \fBparu \-\-sudo doas \-Bi packages/foo\fR, so paru resolves dependencies, including AUR ones. For \fBparu \-Syu\fR to also see custom packages, paru.conf needs a PKGBUILD repository section whose Path is $DSAM_DIR/packages; the paru package's dotfiles provide it. Without it \fBdsam update\fR still upgrades custom packages itself.
 .PP
 For \-bin packages: if upstream CI already builds a native .pkg.tar.zst, use it as the source and make package() copy usr/; otherwise download the release binary, verify its checksum and install it.
 .SS Maintaining a package
 Bump \fBpkgver\fR (reset \fBpkgrel\fR to 1) or \fBpkgrel\fR, update the checksums, run \fBdsam update\fR. dsam compares the PKGBUILD's [epoch:]pkgver\-pkgrel with the installed version using vercmp(8): higher means upgrade, lower means downgrade, equal means nothing. Lowering a version on purpose is how you roll back.
 .PP
-\fBpost\-install.sh\fR runs as your user, with the package directory as working directory, after an install, upgrade or downgrade, never when the version is unchanged. Keep it idempotent.
+\fBpost\-install.sh\fR must be executable. It runs as your user, with the package directory as working directory, after an install, upgrade or downgrade of that package, never when the version is unchanged. Keep it idempotent.
 .PP
 VCS packages (a pkgver() function) have no version dsam can know without building; dsam leaves their upgrades to \fBparu \-Syu \-\-devel\fR and only relinks their dotfiles.
 .SS Removing a package
-Uninstall it (\fBparu \-Rns name\fR), delete its line from the profile list, and for a custom package delete its directory (unlink its dotfiles first: \fBstow \-D \-d packages/name \-t ~ .dotfiles\fR). dsam has no remove command on purpose.
+Uninstall it (\fBparu \-Rns name\fR), delete its line from the profile list, and for a custom package delete its directory (delete its symlinks first: \fBfind ~ \-lname '$DSAM_DIR/packages/name/.dotfiles/*' \-delete\fR). dsam has no remove command on purpose.
 .SH DOTFILES
-Files under packages/<name>/.dotfiles/ mirror $HOME and are symlinked with \fBstow \-\-no\-folding\fR, so every file gets its own symlink and programs writing next to their config do not write into the repository. If a real file already exists at a target, stow aborts and dsam stops with an error: move the file away (or into .dotfiles/) and rerun. \fBdsam \-n config\fR shows the links without making them.
+Files under packages/<name>/.dotfiles/ mirror $HOME and are symlinked one by one (never whole directories), so programs writing next to their config do not write into the repository. Links that already point into the repository are refreshed. A real file or foreign link at a target is never overwritten: dsam warns, skips it and exits with status 1; move the file away (or into .dotfiles/) and rerun. \fBdsam \-n config\fR shows the links without making them.
 .SH DIFF
 No cache is kept; everything comes from pacman's local database.
 .TP
@@ -554,16 +799,18 @@ Files are deliberately out of scope: use \fBdsam info path\fR to ask who owns a 
 .SH ENVIRONMENT
 .TP
 .B DSAM_DIR
-repository path (default ~/dsam).
+repository path (default: the directory of the dsam script if it contains packages/, otherwise ~/dsam).
 .TP
-.B XDG_CACHE_HOME, XDG_CONFIG_HOME, PARU_CONF
-cache for the fetched tomli (~/.cache/dsam/bin), and paru's configuration file location.
+.B XDG_CACHE_HOME
+cache for the fetched tomli (~/.cache/dsam/bin).
 .TP
 .B NO_COLOR
 disables colour. Colour is only used on terminals.
 .SH CAVEATS
 .IP \(bu 2
-Downgrading through paru's PKGBUILD repository has not been verified against every paru version; if \fBdsam update\fR reports a downgrade and the installed version does not change, run \fBparu \-S name\fR yourself and check the output.
+\fBbase\fR and \fB_chroot\fR are a line\-by\-line port of the former base.sh and post\-base.sh. Try them in a virtual machine after every change; they erase disks.
+.IP \(bu 2
+Downgrades are done with \fBparu \-Bi\fR (build, then pacman \-U) and have not been verified against every paru version; if \fBdsam update\fR reports a downgrade and the installed version does not change, run that command yourself and check the output.
 .IP \(bu 2
 Package directory name, pkgname and the name pacman knows must be identical.
 .IP \(bu 2
@@ -572,7 +819,9 @@ Package names with provides (installing "jack" satisfied by another package) are
 tomli's command line is documented by its authors as unstable; the version and sha256 are pinned in packages/tomli\-bin/PKGBUILD, the single source for both the package and the bootstrap download.
 .SH EXAMPLES
 .nf
-dsam install                  # fresh system: install everything declared
+./dsam base laptop /dev/nvme0n1   # from the ISO
+dsam setup                    # first boot
+dsam install                  # install everything declared
 dsam install helix ripgrep    # install and record in the profile
 dsam \-n update                # preview an update
 dsam diff \-\-deps              # what drifted?
@@ -599,6 +848,9 @@ main() {
 		man) cmd_man "$@" ;;
 		version | -V | --version) echo "dsam $VERSION" ;;
 		fetch-tomli) fetch_tomli ;;
+		base) if ((DRY)); then die "-n is not supported for base"; fi; cmd_base "$@" ;;
+		_chroot) cmd_chroot "$@" ;;
+		setup) if ((DRY)); then die "-n is not supported for setup"; fi; guard; cmd_setup "$@" ;;
 		install | update | config | diff | info) guard; "cmd_$cmd" "$@" ;;
 		*) die "unknown command: $cmd (try: dsam help)" ;;
 	esac
